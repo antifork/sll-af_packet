@@ -1,0 +1,223 @@
+--- linux-2.6.22/net/packet/af_packet.c	2007-07-08 19:32:17.000000000 -0400
++++ linux-2.6.22-nb/net/packet/af_packet.c	2007-07-28 19:59:55.000000000 -0400
+@@ -58,6 +58,7 @@
+ #include <linux/inet.h>
+ #include <linux/netdevice.h>
+ #include <linux/if_packet.h>
++#include <linux/if_ether.h>
+ #include <linux/wireless.h>
+ #include <linux/kernel.h>
+ #include <linux/kmod.h>
+@@ -78,6 +79,34 @@
+ #include <linux/poll.h>
+ #include <linux/module.h>
+ #include <linux/init.h>
++#include <linux/time.h>
++
++/* XXX: sockaddr_stat_ll structure replace
++        sockaddr_stat when sockopt PACKET_LLSTAT is set */
++
++struct sockaddr_stat_ll {
++        unsigned short sll_family;   /* Always AF_PACKET */
++        unsigned short sll_protocol; /* Physical layer protocol */
++        int            sll_ifindex;  /* Interface number */
++        unsigned short sll_ipid;     /* ip_id field */
++        unsigned char  sll_pkttype;  /* Packet type */
++        unsigned char  sll_halen;    /* packet tos */
++        struct timeval sll_tstamp;   /* Timestamp */
++} __attribute__((packed));
++
++#define PACKET_LLSTAT    10 
++#define PACKET_TFILTER   11 
++
++#define TFILTER(x)          (1<<(x))
++#define TFILTER_HOST        TFILTER(PACKET_HOST)
++#define TFILTER_BROADCAST   TFILTER(PACKET_BROADCAST)
++#define TFILTER_MULTICAST   TFILTER(PACKET_MULTICAST)
++#define TFILTER_OTHERHOST   TFILTER(PACKET_OTHERHOST)
++#define TFILTER_OUTGOING    TFILTER(PACKET_OUTGOING )
++#define TFILTER_LOOPBACK    TFILTER(PACKET_LOOPBACK )
++#define TFILTER_FASTROUTE   TFILTER(PACKET_FASTROUTE)
++
++#define SLL_HALEN(po,x)     ( po->llstat ? sizeof(struct timeval) : (x))
+ 
+ #ifdef CONFIG_INET
+ #include <net/inet_common.h>
+@@ -195,6 +224,8 @@
+ 	unsigned int		pg_vec_pages;
+ 	unsigned int		pg_vec_len;
+ #endif
++        int                     llstat;         /* XXX: llstat  option */
++        int                     tfilter;        /* XXX: tfilter option */
+ };
+ 
+ struct packet_skb_cb {
+@@ -250,6 +281,7 @@
+ {
+ 	struct sock *sk;
+ 	struct sockaddr_pkt *spkt;
++        struct packet_sock *po;
+ 
+ 	/*
+ 	 *	When we registered the protocol we saved the socket in the data
+@@ -257,6 +289,7 @@
+ 	 */
+ 
+ 	sk = pt->af_packet_priv;
++        po = pkt_sk(sk);
+ 
+ 	/*
+ 	 *	Yank back the headers [hope the device set this
+@@ -269,6 +302,11 @@
+ 	 *	so that this procedure is noop.
+ 	 */
+ 
++        if (po->tfilter) {
++                if (po->tfilter & TFILTER(skb->pkt_type))
++                        goto out;
++        }
++        else
+ 	if (skb->pkt_type == PACKET_LOOPBACK)
+ 		goto out;
+ 
+@@ -444,6 +482,8 @@
+ 
+ static int packet_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
+ {
++        struct sockaddr_stat_ll *pll;
++        struct ethhdr *hm;
+ 	struct sock *sk;
+ 	struct sockaddr_ll *sll;
+ 	struct packet_sock *po;
+@@ -451,12 +491,17 @@
+ 	int skb_len = skb->len;
+ 	unsigned int snaplen, res;
+ 
+-	if (skb->pkt_type == PACKET_LOOPBACK)
+-		goto drop;
+-
+-	sk = pt->af_packet_priv;
++        sk = pt->af_packet_priv;
+ 	po = pkt_sk(sk);
+ 
++        if (po->tfilter) {
++                if (po->tfilter & TFILTER(skb->pkt_type))
++                        goto drop;
++        }
++        else
++        if (skb->pkt_type == PACKET_LOOPBACK)
++                goto drop;
++                
+ 	skb->dev = dev;
+ 
+ 	if (dev->hard_header) {
+@@ -512,10 +557,32 @@
+ 		sll->sll_ifindex = orig_dev->ifindex;
+ 	else
+ 		sll->sll_ifindex = dev->ifindex;
+-	sll->sll_halen = 0;
++	sll->sll_halen = SLL_HALEN(po,0);
+ 
+ 	if (dev->hard_header_parse)
+-		sll->sll_halen = dev->hard_header_parse(skb, sll->sll_addr);
++		sll->sll_halen =  SLL_HALEN(po,dev->hard_header_parse(skb, sll->sll_addr));
++
++        /*  XXX: sockaddr_stat_ll replace sockaddr_ll when PACKET_LLSTAT is set 
++         */
++        if ( po->llstat != 0 ) {
++                pll =(struct sockaddr_stat_ll *)&PACKET_SKB_CB(skb)->sa.ll;
++                hm = (struct ethhdr *)skb_mac_header(skb);
++
++                if (skb->tstamp.tv64 == 0) {
++                        __net_timestamp(skb);
++                        sock_enable_timestamp(sk);
++                }
++
++                skb_get_timestamp(skb, &pll->sll_tstamp);
++        
++                /* set ssl_ipid in case of ip packet ... */
++                if ( hm->h_proto == __constant_htons(ETH_P_IP) ) {
++                        struct iphdr *iph = (struct iphdr *)skb_network_header(skb);
++                        pll->sll_ipid = iph->id;
++                } else  {
++                        pll->sll_ipid = 0;
++                }
++        }
+ 
+ 	PACKET_SKB_CB(skb)->origlen = skb->len;
+ 
+@@ -567,12 +634,17 @@
+ 	struct sk_buff *copy_skb = NULL;
+ 	struct timeval tv;
+ 
+-	if (skb->pkt_type == PACKET_LOOPBACK)
+-		goto drop;
+-
+ 	sk = pt->af_packet_priv;
+ 	po = pkt_sk(sk);
+ 
++        if (po->tfilter) {
++                if (po->tfilter & TFILTER(skb->pkt_type))
++                        goto drop;
++        }
++        else
++	if (skb->pkt_type == PACKET_LOOPBACK)
++	        goto drop;
++
+ 	if (dev->hard_header) {
+ 		if (sk->sk_type != SOCK_DGRAM)
+ 			skb_push(skb, skb->data - skb_mac_header(skb));
+@@ -649,9 +721,9 @@
+ 	h->tp_usec = tv.tv_usec;
+ 
+ 	sll = (struct sockaddr_ll*)((u8*)h + TPACKET_ALIGN(sizeof(*h)));
+-	sll->sll_halen = 0;
++	sll->sll_halen = SLL_HALEN(po,0);
+ 	if (dev->hard_header_parse)
+-		sll->sll_halen = dev->hard_header_parse(skb, sll->sll_addr);
++		sll->sll_halen = SLL_HALEN(po,dev->hard_header_parse(skb, sll->sll_addr));
+ 	sll->sll_family = AF_PACKET;
+ 	sll->sll_hatype = dev->type;
+ 	sll->sll_protocol = skb->protocol;
+@@ -1177,12 +1249,12 @@
+ 	dev = dev_get_by_index(po->ifindex);
+ 	if (dev) {
+ 		sll->sll_hatype = dev->type;
+-		sll->sll_halen = dev->addr_len;
++		sll->sll_halen = SLL_HALEN(po,dev->addr_len);
+ 		memcpy(sll->sll_addr, dev->dev_addr, dev->addr_len);
+ 		dev_put(dev);
+ 	} else {
+ 		sll->sll_hatype = 0;	/* Bad: we have no ARPHRD_UNSPEC */
+-		sll->sll_halen = 0;
++		sll->sll_halen = SLL_HALEN(po,0);
+ 	}
+ 	*uaddr_len = offsetof(struct sockaddr_ll, sll_addr) + sll->sll_halen;
+ 
+@@ -1397,6 +1469,26 @@
+ 		po->origdev = !!val;
+ 		return 0;
+ 	}
++        case PACKET_LLSTAT:     
++        {
++                int val;
++                if (optlen!=sizeof(val))
++                        return -EINVAL;
++                if (copy_from_user(&val,optval,sizeof(val)))
++                        return -EFAULT;
++                pkt_sk(sk)->llstat = val;
++                return 0;
++        }
++        case PACKET_TFILTER:   
++        {
++                int val;
++                if (optlen!=sizeof(val))
++                        return -EINVAL;
++                if (copy_from_user(&val,optval,sizeof(val)))
++                        return -EFAULT;
++                pkt_sk(sk)->tfilter = val;
++                return 0;
++        }
+ 	default:
+ 		return -ENOPROTOOPT;
+ 	}
